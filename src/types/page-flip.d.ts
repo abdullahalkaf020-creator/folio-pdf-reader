@@ -34,6 +34,9 @@ declare module 'page-flip' {
     getPageCount(): number;
     getCurrentPageIndex(): number;
     getOrientation(): 'portrait' | 'landscape';
+    getRender(): unknown;
+    getPageCollection(): unknown;
+    getBoundsRect(): { left: number; top: number; width: number; height: number; pageWidth: number };
     flipNext(corner?: 'top' | 'bottom'): void;
     flipPrev(corner?: 'top' | 'bottom'): void;
     flip(pageNum: number, corner?: 'top' | 'bottom'): void;

@@ -3,21 +3,16 @@ name: Build Android APK
 on:
   push:
     branches: [main, master]
-  pull_request:
-    branches: [main, master]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-env:
-  JAVA_VERSION: '21'
-  NODE_VERSION: '22'
-
 jobs:
   android-debug:
     name: Build debug APK
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,13 +20,14 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: 22
+          cache: npm
 
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: 21
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
@@ -39,25 +35,28 @@ jobs:
       - name: Install Android SDK packages
         run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
 
-      - name: Install JavaScript dependencies
-        run: npm install --no-audit --no-fund
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
 
-      - name: Build web assets
+      - name: Build web application
         run: npm run build
 
-      - name: Generate native Android project
-        run: npx cap add android
+      - name: Generate Android project if missing
+        run: |
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
 
-      - name: Sync Capacitor Android project
+      - name: Sync Android project
         run: npx cap sync android
 
-      - name: Build debug APK
+      - name: Build APK
         working-directory: android
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon assembleDebug
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: folio-pdf-reader-debug-apk

@@ -11,7 +11,8 @@
     "android:init": "cap add android",
     "android:sync": "npm run build && cap sync android",
     "android:open": "cap open android",
-    "android:debug": "npm run android:sync && cd android && ./gradlew assembleDebug"
+    "android:debug": "npm run android:sync && cd android && ./gradlew assembleDebug",
+    "postinstall": "node scripts/patch-page-flip.cjs"
   },
   "dependencies": {
     "@capacitor/android": "^8.0.0",

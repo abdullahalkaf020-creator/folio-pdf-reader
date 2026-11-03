@@ -12,6 +12,133 @@ import type { PDFDocumentProxy } from '../lib/pdf';
 import { pdfjs } from '../lib/pdf';
 import type { Highlight } from '../types';
 
+interface InternalPage {
+  getElement: () => HTMLElement;
+  getTemporaryCopy: () => unknown;
+  hideTemporaryCopy: () => void;
+}
+
+interface InternalHtmlRenderer {
+  leftPage: InternalPage | null;
+  rightPage: InternalPage | null;
+  flippingPage: InternalPage | null;
+  bottomPage: InternalPage | null;
+  shadow: unknown;
+  clear: () => void;
+  drawFrame: () => void;
+  update: () => void;
+}
+
+function yieldToBrowser(): Promise<void> {
+  return new Promise((resolve) => {
+    const idleWindow = window as Window & {
+      requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+    };
+    if (idleWindow.requestIdleCallback) {
+      idleWindow.requestIdleCallback(() => resolve(), { timeout: 90 });
+    } else {
+      window.setTimeout(resolve, 18);
+    }
+  });
+}
+
+/**
+ * PageFlip's stock HTMLRender.clear() scans every PDF page on every animation frame.
+ * Keep the one-time full cleanup, then clean only pages that were active in the last
+ * frame. The four active page references are the only pages PageFlip can draw.
+ */
+function optimizeHtmlRenderer(instance: PageFlip): () => void {
+  const renderer = instance.getRender() as unknown as InternalHtmlRenderer;
+  const collection = instance.getPageCollection() as unknown as { getPages: () => InternalPage[] };
+  if (
+    typeof renderer.clear !== 'function' ||
+    typeof renderer.drawFrame !== 'function' ||
+    typeof renderer.update !== 'function' ||
+    typeof collection.getPages !== 'function'
+  ) {
+    return () => undefined;
+  }
+
+  const originalClear = renderer.clear.bind(renderer);
+  const originalDrawFrame = renderer.drawFrame.bind(renderer);
+  const originalUpdate = renderer.update.bind(renderer);
+  const allPages = collection.getPages();
+  let initialized = false;
+  let previousActive = new Set<InternalPage>();
+  let wasAnimating = false;
+  let hasStaticFrame = false;
+  let forceStaticDraw = true;
+  let lastLeftPage: InternalPage | null = null;
+  let lastRightPage: InternalPage | null = null;
+  let lastBounds = { left: NaN, top: NaN, width: NaN, height: NaN };
+
+  renderer.update = () => {
+    forceStaticDraw = true;
+    originalUpdate();
+  };
+
+  renderer.drawFrame = () => {
+    const animating = renderer.flippingPage !== null || renderer.bottomPage !== null || renderer.shadow !== null;
+    if (animating) {
+      wasAnimating = true;
+      originalDrawFrame();
+      return;
+    }
+
+    const bounds = instance.getBoundsRect();
+    const changed = !hasStaticFrame || wasAnimating || forceStaticDraw ||
+      renderer.leftPage !== lastLeftPage || renderer.rightPage !== lastRightPage ||
+      bounds.left !== lastBounds.left || bounds.top !== lastBounds.top ||
+      bounds.width !== lastBounds.width || bounds.height !== lastBounds.height;
+
+    if (changed) originalDrawFrame();
+    lastLeftPage = renderer.leftPage;
+    lastRightPage = renderer.rightPage;
+    lastBounds = { left: bounds.left, top: bounds.top, width: bounds.width, height: bounds.height };
+    hasStaticFrame = true;
+    wasAnimating = false;
+    forceStaticDraw = false;
+  };
+
+  renderer.clear = () => {
+    const activePages = [renderer.leftPage, renderer.rightPage, renderer.flippingPage, renderer.bottomPage]
+      .filter((page): page is InternalPage => page !== null);
+    const activeSet = new Set(activePages);
+
+    const cleanPage = (page: InternalPage, hide: boolean) => {
+      if (hide) {
+        const element = page.getElement();
+        if (element.style.display !== 'none') element.style.display = 'none';
+      }
+      const temporaryCopy = page.getTemporaryCopy();
+      if (temporaryCopy && temporaryCopy !== renderer.flippingPage) {
+        page.hideTemporaryCopy();
+      }
+    };
+
+    if (!initialized) {
+      for (const page of allPages) cleanPage(page, !activeSet.has(page));
+      initialized = true;
+    } else {
+      for (const page of previousActive) {
+        if (!activeSet.has(page)) cleanPage(page, true);
+        else cleanPage(page, false);
+      }
+      // A temporary fold copy may belong to an active original page. Keep it only
+      // while it is the page currently being folded.
+      for (const page of activePages) cleanPage(page, false);
+    }
+
+    previousActive = activeSet;
+  };
+
+  return () => {
+    renderer.clear = originalClear;
+    renderer.drawFrame = originalDrawFrame;
+    renderer.update = originalUpdate;
+  };
+}
+
 export interface BookReaderHandle {
   next: () => void;
   previous: () => void;
@@ -54,6 +181,8 @@ const BookReader = forwardRef<BookReaderHandle, BookReaderProps>(function BookRe
   const rendering = useRef(new Map<number, Promise<void>>());
   const generation = useRef(0);
   const wantedPages = useRef<Set<number>>(new Set());
+  const renderQueue = useRef<number[]>([]);
+  const renderQueueRunning = useRef(false);
   const [currentPage, setCurrentPage] = useState(Math.max(0, initialPage));
   const [renderProgress, setRenderProgress] = useState(0);
   const pageCount = pdf.numPages;
@@ -79,9 +208,12 @@ const BookReader = forwardRef<BookReaderHandle, BookReaderProps>(function BookRe
       if (version !== generation.current) return;
 
       const pageRotation = (rotation + (page.rotate || 0)) % 360;
-      const viewport = page.getViewport({ scale: 1.55, rotation: pageRotation });
       const deviceMemory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 4;
-      const outputScale = Math.min(deviceMemory <= 3 ? 1.2 : 1.6, Math.max(1, window.devicePixelRatio || 1));
+      // Keep enough resolution for crisp reading while avoiding oversized canvases
+      // that compete with the 3D page animation on Android WebView.
+      const renderScale = deviceMemory <= 3 ? 1.3 : 1.45;
+      const viewport = page.getViewport({ scale: renderScale, rotation: pageRotation });
+      const outputScale = Math.min(deviceMemory <= 3 ? 1.15 : 1.35, Math.max(1, window.devicePixelRatio || 1));
       const canvas = document.createElement('canvas');
       canvas.width = Math.max(1, Math.floor(viewport.width * outputScale));
       canvas.height = Math.max(1, Math.floor(viewport.height * outputScale));
@@ -114,7 +246,11 @@ const BookReader = forwardRef<BookReaderHandle, BookReaderProps>(function BookRe
       layer.style.transform = `scale(${textScale})`;
       layer.style.transformOrigin = 'top left';
       const textContent = await page.getTextContent();
-      const pageHighlights = highlights.filter((item) => item.page === pageNumber);
+      const pageHighlights = highlights
+        .filter((item) => item.page === pageNumber)
+        .map((item) => ({ ...item, normalizedText: item.text.toLowerCase() }));
+      const fragment = document.createDocumentFragment();
+      let createdSpans = 0;
       for (const item of textContent.items) {
         if (!('str' in item) || !item.str) continue;
         const transform = pdfjs.Util.transform(viewport.transform, item.transform);
@@ -128,14 +264,24 @@ const BookReader = forwardRef<BookReaderHandle, BookReaderProps>(function BookRe
         span.style.width = `${Math.max(0, item.width * viewport.scale)}px`;
         span.style.height = `${height * 1.2}px`;
         span.style.transform = `rotate(${Math.atan2(transform[1], transform[0])}rad)`;
-        const matched = pageHighlights.find((highlight) => {
-          const quote = highlight.text.toLowerCase();
-          const run = item.str.toLowerCase();
-          return run.includes(quote) || (run.length > 2 && quote.includes(run));
-        });
+        const run = item.str.toLowerCase();
+        const matched = pageHighlights.find((highlight) => (
+          run.includes(highlight.normalizedText) ||
+          (run.length > 2 && highlight.normalizedText.includes(run))
+        ));
         if (matched) span.classList.add(`saved-highlight-${matched.color}`);
-        layer.appendChild(span);
+        fragment.appendChild(span);
+        createdSpans += 1;
+
+        // Long text layers can contain thousands of spans. Yield between chunks so
+        // touch input and the page-flip animation get time on the main thread.
+        if (createdSpans % 180 === 0) {
+          layer.appendChild(fragment);
+          await yieldToBrowser();
+          if (version !== generation.current || !wantedPages.current.has(pageNumber)) return;
+        }
       }
+      layer.appendChild(fragment);
       if (version !== generation.current || !wantedPages.current.has(pageNumber)) return;
       // In portrait mode StPageFlip may clone the HTML sheets. Update every matching
       // instance so the visible clone receives the newly-rendered canvas as well.
@@ -173,6 +319,26 @@ const BookReader = forwardRef<BookReaderHandle, BookReaderProps>(function BookRe
     return task;
   }, [pdf, pageCount, rotation, highlights, markRendered]);
 
+  const renderPageLatest = useRef(renderPage);
+  renderPageLatest.current = renderPage;
+
+  const pumpRenderQueue = useCallback(async () => {
+    if (renderQueueRunning.current) return;
+    renderQueueRunning.current = true;
+    try {
+      while (renderQueue.current.length > 0) {
+        const pageNumber = renderQueue.current.shift();
+        if (!pageNumber || !wantedPages.current.has(pageNumber)) continue;
+        if (rendered.current.get(pageNumber) === generation.current) continue;
+        await renderPageLatest.current(pageNumber);
+        if (renderQueue.current.length > 0) await yieldToBrowser();
+      }
+    } finally {
+      renderQueueRunning.current = false;
+      if (renderQueue.current.length > 0) void pumpRenderQueue();
+    }
+  }, []);
+
   const renderWindow = useCallback((zeroBasedIndex: number) => {
     const first = Math.max(1, zeroBasedIndex);
     const last = Math.min(pageCount, zeroBasedIndex + 3);
@@ -198,13 +364,20 @@ const BookReader = forwardRef<BookReaderHandle, BookReaderProps>(function BookRe
       }
       rendered.current.delete(pageNumber);
     }
-    for (const page of nextWindow) void renderPage(page);
-  }, [pageCount, renderPage]);
+
+    // Render one page at a time, closest to the current page first. Background pages
+    // are picked up during idle time instead of competing with active touch gestures.
+    renderQueue.current = Array.from(nextWindow)
+      .filter((page) => rendered.current.get(page) !== generation.current)
+      .sort((a, b) => Math.abs(a - first) - Math.abs(b - first));
+    void pumpRenderQueue();
+  }, [pageCount, pumpRenderQueue]);
 
   useLayoutEffect(() => {
     generation.current += 1;
     rendered.current.clear();
     rendering.current.clear();
+    renderQueue.current = [];
     wantedPages.current.clear();
     setRenderProgress(0);
     const host = engineRef.current;
@@ -240,6 +413,7 @@ const BookReader = forwardRef<BookReaderHandle, BookReaderProps>(function BookRe
       renderWindow(index);
     });
     instance.loadFromHTML(pages);
+    const restoreRenderer = optimizeHtmlRenderer(instance);
     setCurrentPage(safeStart);
     renderWindow(safeStart);
     onLoadPageCount(pageCount);
@@ -249,6 +423,7 @@ const BookReader = forwardRef<BookReaderHandle, BookReaderProps>(function BookRe
       const parent = host.parentNode;
       const nextSibling = host.nextSibling;
       try {
+        restoreRenderer();
         instance.destroy();
       } catch (error) {
         console.warn('PageFlip cleanup:', error);
@@ -259,6 +434,7 @@ const BookReader = forwardRef<BookReaderHandle, BookReaderProps>(function BookRe
       if (flipRef.current === instance) flipRef.current = null;
       rendered.current.clear();
       rendering.current.clear();
+      renderQueue.current = [];
     };
     // The PageFlip engine is recreated when the PDF, layout or initial page changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -269,6 +445,7 @@ const BookReader = forwardRef<BookReaderHandle, BookReaderProps>(function BookRe
     generation.current += 1;
     rendered.current.clear();
     rendering.current.clear();
+    renderQueue.current = [];
     setRenderProgress(0);
     renderWindow(flipRef.current?.getCurrentPageIndex() ?? currentPage);
     // eslint-disable-next-line react-hooks/exhaustive-deps
