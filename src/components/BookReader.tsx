@@ -93,6 +93,7 @@ const BookReader = forwardRef<BookReaderHandle, BookReaderProps>(function BookRe
       context.fillRect(0, 0, canvas.width, canvas.height);
       await page.render({
         canvasContext: context,
+        canvas,
         viewport,
         transform: outputScale === 1 ? undefined : [outputScale, 0, 0, outputScale, 0, 0],
         background: '#fffdf8',

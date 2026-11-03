@@ -8,7 +8,7 @@ let databasePromise: Promise<IDBDatabase> | null = null;
 
 function openDatabase(): Promise<IDBDatabase> {
   if (databasePromise) return databasePromise;
-  databasePromise = new Promise((resolve, reject) => {
+  databasePromise = new Promise<IDBDatabase>((resolve, reject) => {
     if (!('indexedDB' in window)) {
       reject(new Error('Penyimpanan lokal tidak tersedia pada perangkat ini.'));
       return;
@@ -30,7 +30,7 @@ function openDatabase(): Promise<IDBDatabase> {
     databasePromise = null;
     throw error;
   });
-  return databasePromise;
+  return databasePromise!;
 }
 
 export async function getAllDocuments(): Promise<LibraryDocument[]> {
